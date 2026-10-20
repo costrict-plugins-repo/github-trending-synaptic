@@ -1,0 +1,83 @@
+{
+  "name": "synaptic",
+  "description": "Persistent local memory for Claude Code — cross-session context, semantic search, zero cloud",
+  "version": "1.7.7",
+  "author": {
+    "name": "HYPERLYNQ",
+    "email": "hyperlynq@gmail.com"
+  },
+  "homepage": "https://github.com/HYPERLYNQ/synaptic",
+  "repository": "https://github.com/HYPERLYNQ/synaptic",
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": [
+    "memory",
+    "context",
+    "mcp",
+    "persistent-memory",
+    "semantic-search",
+    "claude-code",
+    "model-context-protocol",
+    "checkpoint",
+    "auto-save",
+    "project-aware"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hook-launcher.cjs session-start",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hook-launcher.cjs pre-compact",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hook-launcher.cjs stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hook-launcher.cjs user-prompt-submit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hook-launcher.cjs post-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

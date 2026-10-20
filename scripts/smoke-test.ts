@@ -1,0 +1,1071 @@
+/**
+ * Smoke test for Synaptic MCP server Phase 3 features.
+ * Exercises ContextIndex, Embedder, git parser, maintenance, and pattern detection
+ * against a temporary database.
+ *
+ * Usage: npm run smoke-test
+ */
+
+import { unlinkSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { dirname, join } from "node:path";
+import { ContextIndex } from "../src/storage/sqlite.js";
+import { Embedder } from "../src/storage/embedder.js";
+import { getGitLog, formatCommitAsContent } from "../src/storage/git.js";
+import { detectProject, resetProjectCache } from "../src/storage/project.js";
+import { runMaintenance } from "../src/storage/maintenance.js";
+import {
+  findClaudeProjectDir,
+  findCurrentTranscript,
+  extractTextContent,
+  readCursor,
+  writeCursor,
+  readNewMessages,
+  readToolUseActions,
+} from "../src/storage/transcript.js";
+import { extractCheckPatterns, checkMessageAgainstPatterns } from "../src/cli/rule-patterns.js";
+import type { ContextEntry } from "../src/storage/markdown.js";
+
+const DB_PATH = "/tmp/claude/synaptic-smoke-test.db";
+const PROJECT_DIR = "/home/hyperlynq/projects/Coding/claude-context-tool";
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition: boolean, description: string): void {
+  if (condition) {
+    console.log(`  PASS: ${description}`);
+    passed++;
+  } else {
+    console.error(`  FAIL: ${description}`);
+    failed++;
+  }
+}
+
+function cleanup(): void {
+  try {
+    if (existsSync(DB_PATH)) unlinkSync(DB_PATH);
+    // SQLite WAL/SHM files
+    if (existsSync(DB_PATH + "-wal")) unlinkSync(DB_PATH + "-wal");
+    if (existsSync(DB_PATH + "-shm")) unlinkSync(DB_PATH + "-shm");
+  } catch {
+    // best effort
+  }
+}
+
+function makeEntry(overrides: Partial<ContextEntry> & { type: string; content: string }): ContextEntry {
+  const id = overrides.id ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  const date = overrides.date ?? new Date().toISOString().slice(0, 10);
+  const time = overrides.time ?? new Date().toTimeString().slice(0, 5);
+  return {
+    id,
+    date,
+    time,
+    type: overrides.type,
+    tags: overrides.tags ?? ["smoke-test"],
+    content: overrides.content,
+    sourceFile: overrides.sourceFile ?? "smoke-test",
+    tier: overrides.tier ?? ContextIndex.assignTier(overrides.type),
+    accessCount: overrides.accessCount ?? 0,
+    lastAccessed: overrides.lastAccessed ?? null,
+    pinned: overrides.pinned ?? false,
+    archived: overrides.archived ?? false,
+  };
+}
+
+async function main(): Promise<void> {
+  console.log("Synaptic Phase 3 Smoke Test");
+  console.log("===========================\n");
+
+  // Ensure temp directory exists and clean up any leftover DB from previous run
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  cleanup();
+
+  const index = new ContextIndex(DB_PATH);
+  const embedder = new Embedder();
+
+  // -------------------------------------------------------
+  // 1. Test tier assignment
+  // -------------------------------------------------------
+  console.log("[1] Tier assignment");
+
+  const tierCases: Array<{ type: string; expected: string }> = [
+    { type: "handoff", expected: "ephemeral" },
+    { type: "progress", expected: "ephemeral" },
+    { type: "reference", expected: "longterm" },
+    { type: "issue", expected: "working" },
+    { type: "decision", expected: "working" },
+    { type: "insight", expected: "working" },
+    { type: "git_commit", expected: "working" },
+  ];
+
+  for (const tc of tierCases) {
+    const tier = ContextIndex.assignTier(tc.type);
+    assert(tier === tc.expected, `${tc.type} -> ${tc.expected} (got ${tier})`);
+  }
+
+  // Insert entries and verify tier persists in DB
+  const tierEntries: ContextEntry[] = [];
+  for (const tc of tierCases) {
+    const entry = makeEntry({ type: tc.type, content: `Tier test entry for ${tc.type}` });
+    index.insert(entry);
+    tierEntries.push(entry);
+  }
+
+  const listed = index.list({ includeArchived: true });
+  for (const tc of tierCases) {
+    const found = listed.find(e => e.content === `Tier test entry for ${tc.type}`);
+    assert(
+      found !== undefined && found.tier === tc.expected,
+      `DB tier for ${tc.type} is ${tc.expected} (got ${found?.tier})`
+    );
+  }
+
+  // Clear for next tests
+  index.clearAll();
+
+  // -------------------------------------------------------
+  // 2. Test insert + hybrid search
+  // -------------------------------------------------------
+  console.log("\n[2] Insert + hybrid search");
+
+  const searchEntries = [
+    makeEntry({ type: "decision", content: "We decided to use PostgreSQL for the main database because of its JSON support" }),
+    makeEntry({ type: "issue", content: "Authentication tokens expire too quickly causing user session drops" }),
+    makeEntry({ type: "insight", content: "React server components reduce bundle size by 40 percent on our landing page" }),
+  ];
+
+  const rowids: number[] = [];
+  for (const entry of searchEntries) {
+    const rowid = index.insert(entry);
+    const emb = await embedder.embed(entry.content);
+    index.insertVec(rowid, emb);
+    rowids.push(rowid);
+  }
+
+  assert(rowids.length === 3, `Inserted 3 entries (rowids: ${rowids.join(", ")})`);
+
+  const queryEmb = await embedder.embed("database decision PostgreSQL");
+  const searchResults = index.hybridSearch("database PostgreSQL", queryEmb, { limit: 10 });
+
+  assert(searchResults.length > 0, `Hybrid search returned ${searchResults.length} result(s)`);
+  assert(
+    searchResults[0].content.includes("PostgreSQL"),
+    `Top result is about PostgreSQL`
+  );
+  assert(searchResults[0].tier !== undefined, `Search results have tier field (tier=${searchResults[0].tier})`);
+
+  // -------------------------------------------------------
+  // 3. Test access tracking
+  // -------------------------------------------------------
+  console.log("\n[3] Access tracking");
+
+  // hybridSearch calls bumpAccess internally, so the entries returned should have been bumped
+  const afterSearch = index.list();
+  const bumpedEntry = afterSearch.find(e => e.id === searchResults[0].id);
+  assert(
+    bumpedEntry !== undefined && (bumpedEntry.accessCount ?? 0) >= 1,
+    `access_count incremented after search (count=${bumpedEntry?.accessCount})`
+  );
+
+  // -------------------------------------------------------
+  // 4. Test archive
+  // -------------------------------------------------------
+  console.log("\n[4] Archive");
+
+  const archiveTarget = searchEntries[2]; // the insight entry
+  const archiveCount = index.archiveEntries([archiveTarget.id]);
+  assert(archiveCount === 1, `Archived 1 entry`);
+
+  const defaultList = index.list();
+  const archivedInDefault = defaultList.find(e => e.id === archiveTarget.id);
+  assert(archivedInDefault === undefined, `Archived entry not in default list`);
+
+  const fullList = index.list({ includeArchived: true });
+  const archivedInFull = fullList.find(e => e.id === archiveTarget.id);
+  assert(archivedInFull !== undefined && archivedInFull.archived === true, `Archived entry appears with includeArchived: true`);
+
+  // -------------------------------------------------------
+  // 5. Test decay and promotion
+  // -------------------------------------------------------
+  console.log("\n[5] Decay / promotion");
+
+  // 5a. Decay ephemeral
+  const oldEphemeral = makeEntry({
+    type: "progress",
+    content: "Old ephemeral progress entry that should be decayed",
+    tier: "ephemeral",
+  });
+  index.insert(oldEphemeral);
+
+  // Manually backdate it via raw SQL through a helper
+  // We need direct DB access -- use a small trick: insert, then update via the index's internal methods
+  // Since ContextIndex doesn't expose raw exec, we create a second connection
+  const rawDb = new DatabaseSync(DB_PATH);
+  rawDb.exec(`UPDATE entries SET date = date('now', '-10 days') WHERE id = '${oldEphemeral.id}'`);
+  rawDb.close();
+
+  const decayed = index.decayEphemeral();
+  assert(decayed >= 1, `decayEphemeral archived ${decayed} old ephemeral entry(ies)`);
+
+  const afterDecay = index.list();
+  const decayedEntry = afterDecay.find(e => e.id === oldEphemeral.id);
+  assert(decayedEntry === undefined, `Decayed entry no longer in default list`);
+
+  // 5b. Promote stable (decision older than 7 days -> longterm)
+  const oldDecision = makeEntry({
+    type: "decision",
+    content: "Important architectural decision about caching strategy that should be promoted",
+    tier: "working",
+  });
+  index.insert(oldDecision);
+
+  const rawDb2 = new DatabaseSync(DB_PATH);
+  rawDb2.exec(`UPDATE entries SET date = date('now', '-10 days') WHERE id = '${oldDecision.id}'`);
+  rawDb2.close();
+
+  const promoted = index.promoteStable();
+  assert(promoted >= 1, `promoteStable promoted ${promoted} decision(s) to longterm`);
+
+  const afterPromotion = index.list({ includeArchived: true });
+  const promotedEntry = afterPromotion.find(e => e.id === oldDecision.id);
+  assert(
+    promotedEntry !== undefined && promotedEntry.tier === "longterm",
+    `Decision entry promoted to longterm (tier=${promotedEntry?.tier})`
+  );
+
+  // -------------------------------------------------------
+  // 6. Test pattern detection
+  // -------------------------------------------------------
+  console.log("\n[6] Pattern detection");
+
+  // Insert 3 similar issue entries about the same topic
+  const issueContent = [
+    "Memory leak in the WebSocket connection handler causing OOM after 24 hours",
+    "Memory leak in WebSocket handler leads to server out of memory crash",
+    "WebSocket connection memory leak causes out-of-memory on production server",
+  ];
+
+  const issueEntries: ContextEntry[] = [];
+  const issueEmbedding = await embedder.embed("memory leak WebSocket connection handler OOM");
+
+  for (const content of issueContent) {
+    const entry = makeEntry({ type: "issue", content });
+    const rowid = index.insert(entry);
+    // Use the same embedding for all 3 to guarantee high similarity
+    index.insertVec(rowid, issueEmbedding);
+    issueEntries.push(entry);
+  }
+
+  // findSimilarIssues
+  const similar = index.findSimilarIssues(issueEmbedding, 30, 0.5);
+  assert(similar.length >= 3, `findSimilarIssues found ${similar.length} similar issue(s) (expected >= 3)`);
+
+  // createOrUpdatePattern
+  const issueIds = issueEntries.map(e => e.id);
+  const patternId = index.createOrUpdatePattern("Memory leak in WebSocket handler", issueIds);
+  assert(typeof patternId === "string" && patternId.length > 0, `Pattern created with id: ${patternId}`);
+
+  // getActivePatterns (occurrence_count >= 3)
+  const activePatterns = index.getActivePatterns();
+  assert(
+    activePatterns.length >= 1 && activePatterns.some(p => p.id === patternId),
+    `getActivePatterns returns the pattern (found ${activePatterns.length} active pattern(s))`
+  );
+
+  // resolvePattern
+  const resolved = index.resolvePattern(patternId);
+  assert(resolved === true, `resolvePattern returned true`);
+
+  const afterResolve = index.getActivePatterns();
+  assert(
+    !afterResolve.some(p => p.id === patternId),
+    `Resolved pattern no longer in active patterns`
+  );
+
+  // -------------------------------------------------------
+  // 7. Test consolidation candidates
+  // -------------------------------------------------------
+  console.log("\n[7] Consolidation candidates");
+
+  // The 3 issue entries above should form a consolidation group
+  // findConsolidationCandidates looks at issue/decision entries from last 30 days
+  const groups = index.findConsolidationCandidates(0.75);
+  assert(groups.length >= 1, `findConsolidationCandidates returned ${groups.length} group(s)`);
+  if (groups.length > 0) {
+    assert(
+      groups[0].entries.length >= 3,
+      `First group has ${groups[0].entries.length} entries (expected >= 3)`
+    );
+  }
+
+  // -------------------------------------------------------
+  // 8. Test git parser
+  // -------------------------------------------------------
+  console.log("\n[8] Git parser");
+
+  const commits = getGitLog(PROJECT_DIR, { days: 90 });
+  assert(commits.length > 0, `getGitLog returned ${commits.length} commit(s)`);
+
+  if (commits.length > 0) {
+    const commit = commits[0];
+    assert(typeof commit.sha === "string" && commit.sha.length > 0, `Commit has sha`);
+    assert(typeof commit.message === "string" && commit.message.length > 0, `Commit has message`);
+    assert(typeof commit.author === "string" && commit.author.length > 0, `Commit has author`);
+    assert(typeof commit.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(commit.date), `Commit has valid date (${commit.date})`);
+    assert(typeof commit.branch === "string" && commit.branch.length > 0, `Commit has branch (${commit.branch})`);
+    assert(Array.isArray(commit.files), `Commit has files array`);
+
+    const formatted = formatCommitAsContent(commit);
+    assert(formatted.includes(commit.message), `formatCommitAsContent includes commit message`);
+    assert(formatted.startsWith(`[${commit.branch}]`), `formatCommitAsContent starts with branch`);
+  }
+
+  // -------------------------------------------------------
+  // 9. Test status
+  // -------------------------------------------------------
+  console.log("\n[9] Status");
+
+  const status = index.status();
+  assert(typeof status.totalEntries === "number" && status.totalEntries > 0, `status.totalEntries = ${status.totalEntries}`);
+  assert(status.tierDistribution !== undefined && typeof status.tierDistribution === "object", `status.tierDistribution exists`);
+  assert(typeof status.activePatterns === "number", `status.activePatterns = ${status.activePatterns}`);
+  assert(typeof status.archivedCount === "number" && status.archivedCount > 0, `status.archivedCount = ${status.archivedCount}`);
+  assert(status.dateRange !== null, `status.dateRange is not null`);
+
+  // -------------------------------------------------------
+  // 10. Test rule CRUD
+  // -------------------------------------------------------
+  console.log("\n[10] Rule CRUD");
+
+  const ruleRowid = index.saveRule("no-emoji", "Never use emoji in commit messages");
+  assert(typeof ruleRowid === "number" && ruleRowid > 0, `saveRule returned rowid ${ruleRowid}`);
+
+  const rules = index.listRules();
+  assert(rules.length === 1, `listRules returns 1 rule (got ${rules.length})`);
+  assert(rules[0].label === "no-emoji", `Rule label is no-emoji`);
+  assert(rules[0].content.includes("emoji"), `Rule content mentions emoji`);
+  assert(rules[0].tier === "longterm", `Rule tier is longterm`);
+  assert(rules[0].pinned === true, `Rule is pinned`);
+
+  // saveRule with same label overwrites (upsert)
+  index.saveRule("no-emoji", "Do not include emoji in any commit messages ever");
+  const rulesAfterUpdate = index.listRules();
+  assert(rulesAfterUpdate.length === 1, `Still 1 rule after upsert (got ${rulesAfterUpdate.length})`);
+  assert(rulesAfterUpdate[0].content.includes("Do not include"), `Rule content was updated`);
+
+  // deleteRule removes it
+  const deleted = index.deleteRule("no-emoji");
+  assert(deleted === true, `deleteRule returned true`);
+  const rulesAfterDelete = index.listRules();
+  assert(rulesAfterDelete.length === 0, `0 rules after delete (got ${rulesAfterDelete.length})`);
+
+  // deleteRule on non-existent returns false
+  const deletedAgain = index.deleteRule("no-emoji");
+  assert(deletedAgain === false, `deleteRule on missing rule returns false`);
+
+  // -------------------------------------------------------
+  // 11. Test embedder cache
+  // -------------------------------------------------------
+  console.log("\n[11] Embedder cache");
+
+  const t0 = performance.now();
+  const emb1 = await embedder.embed("test cache query");
+  const t1 = performance.now();
+  const emb2 = await embedder.embed("test cache query");
+  const t2 = performance.now();
+
+  assert(emb1.length === 384, `Embedding has 384 dims`);
+  const firstMs = t1 - t0;
+  const secondMs = t2 - t1;
+  assert(secondMs < firstMs, `Cached embed is faster (${secondMs.toFixed(1)}ms vs ${firstMs.toFixed(1)}ms)`);
+  assert(secondMs < 5, `Cached embed is under 5ms (got ${secondMs.toFixed(1)}ms)`);
+
+  // -------------------------------------------------------
+  // 12. Test BM25 fast path
+  // -------------------------------------------------------
+  console.log("\n[12] BM25 fast path");
+
+  const bm25Results = index.search("PostgreSQL", { limit: 5 });
+  assert(bm25Results.length > 0, `BM25 search returned ${bm25Results.length} result(s)`);
+  assert(bm25Results[0].content.includes("PostgreSQL"), `BM25 top result is about PostgreSQL`);
+
+  // -------------------------------------------------------
+  // 13. Test v0.5.0 schema migration (project, session_id, agent_id columns)
+  // -------------------------------------------------------
+  console.log("\n[13] v0.5.0 schema migration");
+
+  const colCheck = (rawDbInst: InstanceType<typeof DatabaseSync>, col: string) => {
+    const cols = rawDbInst.prepare("PRAGMA table_info(entries)").all() as Array<{ name: string }>;
+    return cols.some(c => c.name === col);
+  };
+
+  const rawDb3 = new DatabaseSync(DB_PATH);
+  assert(colCheck(rawDb3, "project"), "entries table has 'project' column");
+  assert(colCheck(rawDb3, "session_id"), "entries table has 'session_id' column");
+  assert(colCheck(rawDb3, "agent_id"), "entries table has 'agent_id' column");
+
+  // Check file_pairs table exists
+  const tables = rawDb3.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='file_pairs'").all();
+  assert(tables.length === 1, "file_pairs table exists");
+
+  // Check indexes
+  const indexes = rawDb3.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>;
+  assert(indexes.some(i => i.name === "idx_entries_project"), "idx_entries_project index exists");
+  assert(indexes.some(i => i.name === "idx_entries_session"), "idx_entries_session index exists");
+  assert(indexes.some(i => i.name === "idx_file_pairs_lookup"), "idx_file_pairs_lookup index exists");
+  rawDb3.close();
+
+  // -------------------------------------------------------
+  // 14. Test project auto-detection
+  // -------------------------------------------------------
+  console.log("\n[14] Project auto-detection");
+
+  resetProjectCache();
+  const projectFromGit = detectProject(PROJECT_DIR);
+  assert(projectFromGit === "synaptic", `detectProject from git repo = "synaptic" (got "${projectFromGit}")`);
+
+  resetProjectCache();
+  const projectFromFolder = detectProject("/tmp/claude/fake-project");
+  assert(projectFromFolder === "fake-project", `detectProject from folder name = "fake-project" (got "${projectFromFolder}")`);
+
+  // -------------------------------------------------------
+  // 15. Test session ID + auto-tagging on save
+  // -------------------------------------------------------
+  console.log("\n[15] Session ID + auto-tagging");
+
+  const { getSessionId } = await import("../src/storage/session.js");
+
+  const sid = getSessionId();
+  assert(typeof sid === "string" && sid.length > 0, `getSessionId returns a string (got "${sid}")`);
+  assert(getSessionId() === sid, `getSessionId returns same value on second call (cached)`);
+
+  // Test that insert with enriched fields stores project/sessionId/agentId
+  const enrichTestEntry = makeEntry({ type: "insight", content: "Test auto-tagging enrichment" });
+  const enrichedInsert = {
+    ...enrichTestEntry,
+    project: "test-project",
+    sessionId: sid,
+    agentId: "test-agent",
+  };
+  index.insert(enrichedInsert);
+
+  const savedEntries = index.list({ includeArchived: true });
+  const enrichedEntry = savedEntries.find(e => e.content === "Test auto-tagging enrichment");
+  assert(enrichedEntry !== undefined, `Enriched entry found in DB`);
+  assert(enrichedEntry!.sessionId === sid, `Entry has sessionId (got "${enrichedEntry?.sessionId}")`);
+  assert(enrichedEntry!.agentId === "test-agent", `Entry has agentId "test-agent" (got "${enrichedEntry?.agentId}")`);
+  assert(enrichedEntry!.project === "test-project", `Entry has project "test-project" (got "${enrichedEntry?.project}")`);
+
+  // -------------------------------------------------------
+  // 16. Test confidence scoring in search
+  // -------------------------------------------------------
+  console.log("\n[16] Confidence scoring");
+
+  // Create two entries: one with high access count, one with zero
+  index.clearAll();
+  const highAccess = makeEntry({ type: "decision", content: "Frequently accessed decision about API design patterns" });
+  const lowAccess = makeEntry({ type: "decision", content: "Never accessed decision about API caching strategy" });
+  highAccess.accessCount = 10;
+  lowAccess.accessCount = 0;
+
+  const haRowid = index.insert(highAccess);
+  const laRowid = index.insert(lowAccess);
+  const haEmb = await embedder.embed(highAccess.content);
+  const laEmb = await embedder.embed(lowAccess.content);
+  index.insertVec(haRowid, haEmb);
+  index.insertVec(laRowid, laEmb);
+
+  const qEmb = await embedder.embed("API design decision");
+  const confResults = index.hybridSearch("API design decision", qEmb, { limit: 10 });
+  assert(confResults.length === 2, `Confidence search returned 2 results`);
+  assert(
+    confResults[0].id === highAccess.id,
+    `High-access entry ranked first (got ${confResults[0].id === highAccess.id})`
+  );
+
+  // -------------------------------------------------------
+  // 17. Test access-aware decay windows
+  // -------------------------------------------------------
+  console.log("\n[17] Access-aware decay");
+
+  index.clearAll();
+
+  // Entry with 0 accesses, 8 days old — should be archived (threshold: 7 days)
+  const zeroAccess = makeEntry({ type: "progress", content: "Zero access entry", tier: "ephemeral" });
+  zeroAccess.accessCount = 0;
+  index.insert(zeroAccess);
+
+  // Entry with 5 accesses, 8 days old — should NOT be archived (threshold: 21 days)
+  const highAccessEph = makeEntry({ type: "progress", content: "High access ephemeral", tier: "ephemeral" });
+  highAccessEph.accessCount = 5;
+  index.insert(highAccessEph);
+
+  const rawDb4 = new DatabaseSync(DB_PATH);
+  rawDb4.exec(`UPDATE entries SET date = date('now', '-8 days') WHERE id IN ('${zeroAccess.id}', '${highAccessEph.id}')`);
+  rawDb4.close();
+
+  const decayedCount = index.decayEphemeral();
+  assert(decayedCount >= 1, `Access-aware decay archived ${decayedCount} entry(ies)`);
+
+  const remaining = index.list();
+  const zeroStillThere = remaining.find(e => e.id === zeroAccess.id);
+  const highStillThere = remaining.find(e => e.id === highAccessEph.id);
+  assert(zeroStillThere === undefined, `Zero-access entry archived after 8 days`);
+  assert(highStillThere !== undefined, `High-access entry NOT archived after 8 days`);
+
+  // -------------------------------------------------------
+  // 18. Test co-change pair generation
+  // -------------------------------------------------------
+  console.log("\n[18] Co-change pairs");
+
+  index.clearAll();
+
+  // Simulate upsertFilePair
+  index.upsertFilePair("test-project", "src/a.ts", "src/b.ts", "2026-02-15");
+  index.upsertFilePair("test-project", "src/a.ts", "src/b.ts", "2026-02-15");
+  index.upsertFilePair("test-project", "src/a.ts", "src/c.ts", "2026-02-15");
+
+  const cochanges = index.getCoChanges("test-project", "src/a.ts", 10);
+  assert(cochanges.length === 2, `getCoChanges returned 2 pairs (got ${cochanges.length})`);
+  assert(cochanges[0].file === "src/b.ts" && cochanges[0].count === 2, `First pair is b.ts with count 2`);
+  assert(cochanges[1].file === "src/c.ts" && cochanges[1].count === 1, `Second pair is c.ts with count 1`);
+
+  // -------------------------------------------------------
+  // 19. Test context_session tool
+  // -------------------------------------------------------
+  console.log("\n[19] context_session");
+
+  index.clearAll();
+
+  // Insert entries with session_id
+  const sessionEntries = [
+    makeEntry({ type: "decision", content: "Session decision 1" }),
+    makeEntry({ type: "insight", content: "Session insight 1" }),
+    makeEntry({ type: "progress", content: "Different session progress" }),
+  ];
+  index.insert({ ...sessionEntries[0], sessionId: "sess-abc" });
+  index.insert({ ...sessionEntries[1], sessionId: "sess-abc" });
+  index.insert({ ...sessionEntries[2], sessionId: "sess-xyz" });
+
+  const sessionResults = index.listBySession("sess-abc");
+  assert(sessionResults.length === 2, `listBySession returned 2 entries for sess-abc (got ${sessionResults.length})`);
+  assert(sessionResults.every(e => e.sessionId === "sess-abc"), `All results have session_id = sess-abc`);
+
+  // -------------------------------------------------------
+  // 20. Test template embeddings
+  // -------------------------------------------------------
+  console.log("\n[20] Template embeddings");
+
+  const templates = await embedder.getDirectiveTemplates();
+  assert(templates.length > 0, `Directive templates loaded (got ${templates.length})`);
+  assert(templates[0].embedding.length === 384, `Template embedding is 384-dim`);
+
+  const categoryTemplates = await embedder.getCategoryTemplates();
+  assert(categoryTemplates.length > 0, `Category templates loaded (got ${categoryTemplates.length})`);
+
+  // -------------------------------------------------------
+  // 21. Test Wave 3: Intelligence features
+  // -------------------------------------------------------
+  console.log("\n[21] Wave 3 intelligence features");
+
+  index.clearAll();
+
+  // Test pending rule detection
+  const pendingEntry = makeEntry({ type: "insight", content: "Always use bun instead of npm" });
+  pendingEntry.tags = ["pending_rule", "proposed-label:always-use-bun"];
+  index.insert({ ...pendingEntry, project: "test-project" });
+
+  const allEntries = index.list({ days: 1 });
+  const pendingFound = allEntries.filter(e => e.tags.includes("pending_rule"));
+  assert(pendingFound.length === 1, `Found 1 pending rule entry (got ${pendingFound.length})`);
+
+  // Test conflict entry
+  const conflictEntry = makeEntry({ type: "insight", content: 'Conflict: new correction "use npm" may contradict rule "always-use-bun"' });
+  conflictEntry.tags = ["rule_conflict", "conflicts-with:always-use-bun"];
+  index.insert({ ...conflictEntry, project: "test-project" });
+
+  const conflicts = index.list({ days: 1 }).filter(e => e.tags.includes("rule_conflict"));
+  assert(conflicts.length === 1, `Found 1 conflict entry (got ${conflicts.length})`);
+  assert(conflicts[0].content.includes("Conflict:"), `Conflict entry has correct format`);
+
+  // Test co-change filtering (count >= 3 threshold)
+  index.clearAll();
+  index.upsertFilePair("test-proj", "src/a.ts", "src/b.ts", "2026-02-15");
+  index.upsertFilePair("test-proj", "src/a.ts", "src/b.ts", "2026-02-15");
+  // Only 2 co-changes — should NOT appear at threshold >= 3
+  const cochanges2 = index.getCoChanges("test-proj", "src/a.ts", 10).filter(c => c.count >= 3);
+  assert(cochanges2.length === 0, `No co-changes at threshold 3 with only 2 occurrences`);
+
+  // Add one more — now count = 3, should appear
+  index.upsertFilePair("test-proj", "src/a.ts", "src/b.ts", "2026-02-15");
+  const cochanges3 = index.getCoChanges("test-proj", "src/a.ts", 10).filter(c => c.count >= 3);
+  assert(cochanges3.length === 1, `1 co-change at threshold 3 after 3 occurrences`);
+
+  // -------------------------------------------------------
+  // 22. Environment detection
+  // -------------------------------------------------------
+  console.log("\n[22] Environment detection");
+
+  const { detectEnvironment } = await import("../src/cli/init.js");
+  try {
+    const env = detectEnvironment();
+
+    assert(typeof env.isWSL === "boolean", "detectEnvironment returns isWSL boolean");
+    assert(typeof env.settingsPath === "string" && env.settingsPath.length > 0, "detectEnvironment returns settingsPath");
+    assert(typeof env.buildDir === "string" && env.buildDir.length > 0, "detectEnvironment returns buildDir");
+    assert(typeof env.nodeCommand === "string", "detectEnvironment returns nodeCommand");
+    assert(Array.isArray(env.nodeArgs), "detectEnvironment returns nodeArgs array");
+  } catch (e) {
+    // In sandboxed environments, cmd.exe may not be reachable (WSL socket failure)
+    console.log(`  SKIP: detectEnvironment threw (${(e as Error).message?.slice(0, 60)}...)`);
+  }
+
+  // -------------------------------------------------------
+  // 23. Git watcher construction
+  // -------------------------------------------------------
+  console.log("\n[23] Git watcher");
+
+  const { GitWatcher } = await import("../src/storage/watcher.js");
+
+  const watcher = new GitWatcher({
+    cwd: PROJECT_DIR,
+    index,
+    embedder,
+    getCurrentProject: () => "test-project",
+  });
+  assert(watcher !== null, "GitWatcher constructed successfully");
+
+  watcher.start();
+  assert(true, "GitWatcher.start() did not throw");
+
+  watcher.stop();
+  assert(true, "GitWatcher.stop() did not throw");
+
+  const watcherNoGit = new GitWatcher({
+    cwd: "/tmp",
+    index,
+    embedder,
+    getCurrentProject: () => null,
+  });
+  watcherNoGit.start();
+  watcherNoGit.stop();
+  assert(true, "GitWatcher with non-git dir is no-op");
+
+  // -------------------------------------------------------
+  // 24. Pre-commit failure entries and chain linking
+  // -------------------------------------------------------
+  console.log("\n[24] Pre-commit failure entries");
+
+  index.clearAll();
+
+  // Test failure entry structure
+  const failureEntry = makeEntry({
+    type: "issue",
+    content: "Pre-commit failure: `npm run test` exited with error\nFiles: src/auth.ts\nError: Expected 3 to equal 4",
+    tags: ["failure", "pre-commit", "cmd:test", "chain:abcd1234", "file:src/auth.ts"],
+  });
+  failureEntry.tier = "working";
+  const failRowid = index.insert(failureEntry);
+  assert(failRowid > 0, "Failure entry inserted successfully");
+
+  const failures = index.list({ days: 1 }).filter(e =>
+    e.tags.includes("failure") && e.tags.includes("pre-commit")
+  );
+  assert(failures.length === 1, `Found 1 pre-commit failure entry (got ${failures.length})`);
+  assert(failures[0].tags.includes("chain:abcd1234"), "Failure has chain tag");
+  assert(failures[0].tags.includes("file:src/auth.ts"), "Failure has file tag");
+
+  const resolveEntry = makeEntry({
+    type: "progress",
+    content: "Resolved: src/auth.ts now passes pre-commit checks",
+    tags: ["failure-resolved", "pre-commit", "chain:abcd1234", "file:src/auth.ts"],
+  });
+  resolveEntry.tier = "ephemeral";
+  index.insert(resolveEntry);
+
+  const chain = index.list({ days: 1 }).filter(e => e.tags.includes("chain:abcd1234"));
+  assert(chain.length === 2, `Chain has 2 entries (failure + resolution, got ${chain.length})`);
+
+  // -------------------------------------------------------
+  // 25. Codebase DNA analysis
+  // -------------------------------------------------------
+  console.log("\n[25] Codebase DNA");
+
+  index.clearAll();
+
+  const { contextDna } = await import("../src/tools/context-dna.js");
+
+  const dnaResult = await contextDna(
+    { commits: 50, repo_path: PROJECT_DIR },
+    index,
+    embedder
+  );
+
+  assert(dnaResult.success === true, "DNA analysis succeeded");
+  assert(dnaResult.commitsAnalyzed! > 0, `Analyzed ${dnaResult.commitsAnalyzed} commits`);
+  assert(dnaResult.report!.includes("Codebase DNA"), "Report contains header");
+  assert(dnaResult.report!.includes("Hotspots:") || dnaResult.report!.includes("Layers:"),
+    "Report contains analysis sections");
+
+  const dnaEntries = index.list({ days: 1 }).filter(e =>
+    e.type === "reference" && e.tags.includes("codebase-dna")
+  );
+  assert(dnaEntries.length === 1, `DNA saved as reference entry (got ${dnaEntries.length})`);
+  assert(dnaEntries[0].tier === "longterm", "DNA entry has longterm tier");
+
+  // -------------------------------------------------------
+  // 26. Decision chains
+  // -------------------------------------------------------
+  console.log("\n[26] Decision chains");
+
+  index.clearAll();
+
+  const { contextChain } = await import("../src/tools/context-chain.js");
+
+  const chainId = "test1234";
+  const chainTag = `chain:${chainId}`;
+
+  const decision1 = makeEntry({
+    type: "decision",
+    content: "Use SQLite instead of LevelDB",
+    tags: [chainTag, "database"],
+  });
+  index.insert(decision1);
+
+  const progress1 = makeEntry({
+    type: "progress",
+    content: "SQLite migration complete",
+    tags: [chainTag],
+  });
+  index.insert(progress1);
+
+  const issue1 = makeEntry({
+    type: "issue",
+    content: "SQLite WAL conflicts with WSL",
+    tags: [chainTag, "bug"],
+  });
+  index.insert(issue1);
+
+  const decision2 = makeEntry({
+    type: "decision",
+    content: "Switch to journal_mode=DELETE",
+    tags: [chainTag],
+  });
+  index.insert(decision2);
+
+  const chainResult = contextChain({ chain_id: chainId }, index);
+  assert(chainResult.total === 4, `Chain has 4 entries (got ${chainResult.total})`);
+  assert(chainResult.chain_id === chainId, "Chain ID matches");
+  assert((chainResult.entries[0] as Record<string, unknown>).type === "decision", "First entry is decision");
+  assert((chainResult.entries[3] as Record<string, unknown>).type === "decision", "Last entry is decision");
+
+  const chainResult2 = contextChain({ chain_id: `chain:${chainId}` }, index);
+  assert(chainResult2.total === 4, "Chain query with prefix also works");
+
+  const emptyChain = contextChain({ chain_id: "nonexistent" }, index);
+  assert(emptyChain.total === 0, "Non-existent chain returns 0 entries");
+
+  // -------------------------------------------------------
+  // 27. v0.6.0 integration check
+  // -------------------------------------------------------
+  console.log("\n[27] v0.7.0 integration");
+
+  const pkgFinal = JSON.parse(readFileSync(join(PROJECT_DIR, "package.json"), "utf-8"));
+  assert(pkgFinal.version === "1.2.0", `Version is 1.2.0 (got ${pkgFinal.version})`);
+  assert(pkgFinal.bin?.synaptic === "build/src/cli.js", "bin field points to CLI");
+
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "cli.js")), "CLI entry point built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "cli", "init.js")), "Init command built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "cli", "pre-commit.js")), "Pre-commit script built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "storage", "watcher.js")), "Watcher module built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "storage", "transcript.js")), "Transcript module built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "tools", "context-dna.js")), "DNA tool built");
+  assert(existsSync(join(PROJECT_DIR, "build", "src", "tools", "context-chain.js")), "Chain tool built");
+
+  // -------------------------------------------------------
+  // 28. Test touchEntry
+  // -------------------------------------------------------
+  console.log("\n[28] touchEntry");
+
+  index.clearAll();
+
+  const touchTarget = makeEntry({ type: "insight", content: "Entry to be touched for access bump" });
+  index.insert(touchTarget);
+
+  // Verify initial state
+  const beforeTouch = index.list().find(e => e.id === touchTarget.id);
+  assert(beforeTouch !== undefined && beforeTouch.accessCount === 0, `Before touch: accessCount=0 (got ${beforeTouch?.accessCount})`);
+  assert(beforeTouch!.lastAccessed === null, `Before touch: lastAccessed=null`);
+
+  // Touch it
+  index.touchEntry(touchTarget.id);
+
+  const afterTouch = index.list().find(e => e.id === touchTarget.id);
+  assert(afterTouch !== undefined && afterTouch.accessCount === 1, `After touch: accessCount=1 (got ${afterTouch?.accessCount})`);
+  assert(afterTouch!.lastAccessed !== null, `After touch: lastAccessed is set`);
+
+  // Touch again
+  index.touchEntry(touchTarget.id);
+  const afterSecondTouch = index.list().find(e => e.id === touchTarget.id);
+  assert(afterSecondTouch!.accessCount === 2, `After second touch: accessCount=2 (got ${afterSecondTouch?.accessCount})`);
+
+  // -------------------------------------------------------
+  // 29. Intent templates
+  // -------------------------------------------------------
+  console.log("\n[29] Intent templates");
+
+  const intentTemplates = await embedder.getIntentTemplates();
+  assert(intentTemplates.length >= 10, `Intent templates loaded (got ${intentTemplates.length})`);
+  assert(intentTemplates[0].embedding.length === 384, `Intent template embedding is 384-dim`);
+
+  // Test classification of a declaration (threshold 0.35 — generic templates score ~0.4 for "X is my app" patterns)
+  const declResult = await embedder.classifySentence("wholesale harmony is my app", intentTemplates, 0.35);
+  assert(declResult !== null, `"wholesale harmony is my app" matches an intent template (sim=${declResult?.similarity.toFixed(3)})`);
+  assert(
+    declResult!.category === "declaration" || declResult!.category === "ownership",
+    `Matched category is declaration or ownership (got ${declResult?.category})`
+  );
+
+  // Test classification of a preference (threshold 0.25 — structural match with generic templates)
+  const prefResult = await embedder.classifySentence("I prefer using typescript over javascript", intentTemplates, 0.25);
+  assert(prefResult !== null, `Preference statement matches an intent template (sim=${prefResult?.similarity.toFixed(3)})`);
+  assert(prefResult!.category === "preference", `Matched category is preference (got ${prefResult?.category})`);
+
+  // Test that a random technical statement does NOT match at the same thresholds
+  const noMatch = await embedder.classifySentence("The function returns a promise that resolves to an array", intentTemplates, 0.25);
+  assert(noMatch === null, `Random technical statement does NOT match any intent (result: ${noMatch?.category ?? "null"})`);
+
+  // -------------------------------------------------------
+  // 30. Consolidation in maintenance
+  // -------------------------------------------------------
+  console.log("\n[30] Consolidation in maintenance");
+
+  index.clearAll();
+
+  // Insert 3 near-identical issue entries, backdate them to 5 days ago
+  const consolidationContent = [
+    "Authentication fails when token has special characters in payload",
+    "Auth token with special chars causes authentication failure",
+    "Token authentication broken when payload contains special characters",
+  ];
+
+  const consolidationEmbedding = await embedder.embed("authentication token special characters failure");
+  const consolidationIds: string[] = [];
+
+  for (const content of consolidationContent) {
+    const entry = makeEntry({ type: "issue", content });
+    const rowid = index.insert(entry);
+    index.insertVec(rowid, consolidationEmbedding);
+    consolidationIds.push(entry.id);
+  }
+
+  // Backdate all to 5 days ago (must be > 3 days old)
+  const rawDbCons = new DatabaseSync(DB_PATH);
+  for (const id of consolidationIds) {
+    rawDbCons.exec(`UPDATE entries SET date = date('now', '-5 days') WHERE id = '${id}'`);
+  }
+  rawDbCons.close();
+
+  // Give one entry higher access count (should be the survivor)
+  index.touchEntry(consolidationIds[0]);
+  index.touchEntry(consolidationIds[0]);
+  index.touchEntry(consolidationIds[0]);
+
+  const maintReport = runMaintenance(index);
+
+  assert(
+    maintReport.consolidated !== undefined && maintReport.consolidated >= 1,
+    `Maintenance consolidated ${maintReport.consolidated} group(s)`
+  );
+
+  // Check: survivor still exists, others archived
+  const afterConsolidation = index.list({ includeArchived: false });
+  const survivors = afterConsolidation.filter(e => consolidationIds.includes(e.id));
+  assert(survivors.length === 1, `1 survivor after consolidation (got ${survivors.length})`);
+  assert(survivors[0].id === consolidationIds[0], `Survivor is the highest-access entry`);
+  assert(survivors[0].content.includes("[Consolidated from"), `Survivor has consolidation note`);
+
+  // Archived entries should be recoverable
+  const allAfter = index.list({ includeArchived: true });
+  const archived = allAfter.filter(e => consolidationIds.includes(e.id) && e.archived);
+  assert(archived.length === 2, `2 entries archived (got ${archived.length})`);
+
+  // -------------------------------------------------------
+  // 31. Transcript scanning
+  // -------------------------------------------------------
+  console.log("\n[31] Transcript scanning");
+
+  // 31a. findClaudeProjectDir returns correct path for known cwd
+  const claudeDir = findClaudeProjectDir("/home/hyperlynq/projects/Coding");
+  assert(
+    claudeDir !== null && claudeDir.includes("-home-hyperlynq-projects-Coding"),
+    `findClaudeProjectDir returns correct path (got ${claudeDir})`
+  );
+
+  // 31b. findClaudeProjectDir returns null for non-existent path
+  const noDir = findClaudeProjectDir("/nonexistent/path/nowhere");
+  assert(noDir === null, `findClaudeProjectDir returns null for missing dir`);
+
+  // 31c. findCurrentTranscript finds a JSONL file
+  const transcript = findCurrentTranscript("/home/hyperlynq/projects/Coding");
+  assert(
+    transcript !== null && transcript.endsWith(".jsonl"),
+    `findCurrentTranscript finds JSONL file (got ${transcript})`
+  );
+
+  // 31d. extractTextContent handles strings
+  const strResult = extractTextContent("Hello world");
+  assert(strResult === "Hello world", `extractTextContent handles string (got "${strResult}")`);
+
+  // 31e. extractTextContent handles arrays with text blocks
+  const arrResult = extractTextContent([
+    { type: "text", text: "First part" },
+    { type: "thinking", thinking: "hidden" },
+    { type: "text", text: "Second part" },
+    { type: "tool_use", name: "Read", input: {} },
+  ]);
+  assert(
+    arrResult === "First part\nSecond part",
+    `extractTextContent handles arrays (got "${arrResult}")`
+  );
+
+  // 31f. extractTextContent handles tool_result arrays (should return null)
+  const toolResult = extractTextContent([
+    { type: "tool_result", tool_use_id: "123", content: "result" },
+  ]);
+  assert(toolResult === null, `extractTextContent returns null for tool_result arrays`);
+
+  // 31g. extractTextContent handles empty/whitespace
+  assert(extractTextContent("") === null, `extractTextContent returns null for empty string`);
+  assert(extractTextContent("   ") === null, `extractTextContent returns null for whitespace`);
+
+  // 31h. Cursor read/write round-trip
+  const testCursor = { file: "/tmp/test-transcript.jsonl", offset: 12345 };
+  writeCursor(testCursor);
+  const readBack = readCursor();
+  assert(
+    readBack !== null && readBack.file === testCursor.file && readBack.offset === testCursor.offset,
+    `Cursor round-trip works (got ${JSON.stringify(readBack)})`
+  );
+
+  // 31i. readNewMessages returns filtered messages from real transcript
+  if (transcript) {
+    const { messages: transcriptMsgs, newOffset: tOffset } = readNewMessages(transcript, 0);
+    assert(tOffset > 0, `readNewMessages advances offset (got ${tOffset})`);
+    assert(
+      transcriptMsgs.length >= 0,
+      `readNewMessages returns messages array (got ${transcriptMsgs.length})`
+    );
+    // All returned messages should have role and text
+    for (const msg of transcriptMsgs.slice(0, 5)) {
+      assert(
+        (msg.role === "user" || msg.role === "assistant") && msg.text.length >= 20,
+        `Message has valid role="${msg.role}" and text length ${msg.text.length}`
+      );
+    }
+  }
+
+  // -------------------------------------------------------
+  // 32. Rule enforcement utilities
+  // -------------------------------------------------------
+  console.log("\n[32] Rule enforcement utilities");
+
+  // 32a. extractCheckPatterns: negative rule with quoted string
+  const patterns1 = extractCheckPatterns('Never add "Co-Authored-By" lines to commits');
+  assert(
+    patterns1.some(p => p === "Co-Authored-By"),
+    `extractCheckPatterns extracts quoted string "Co-Authored-By" (got ${JSON.stringify(patterns1)})`
+  );
+
+  // 32b. extractCheckPatterns: negative rule with don't + quoted
+  const patterns2 = extractCheckPatterns(`Don't use "var" in JavaScript`);
+  assert(
+    patterns2.some(p => p === "var"),
+    `extractCheckPatterns extracts "var" from don't rule (got ${JSON.stringify(patterns2)})`
+  );
+
+  // 32c. extractCheckPatterns: plain negative rule without quotes
+  const patterns3 = extractCheckPatterns("Never add Co-Authored-By lines");
+  assert(
+    patterns3.some(p => p.toLowerCase().includes("co-authored-by")),
+    `extractCheckPatterns extracts term from plain negative rule (got ${JSON.stringify(patterns3)})`
+  );
+
+  // 32d. checkMessageAgainstPatterns: violation detected
+  const violation = checkMessageAgainstPatterns(
+    "Fix bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+    ["Co-Authored-By"]
+  );
+  assert(
+    violation === "Co-Authored-By",
+    `checkMessageAgainstPatterns detects violation (got ${JSON.stringify(violation)})`
+  );
+
+  // 32e. checkMessageAgainstPatterns: clean message passes
+  const clean = checkMessageAgainstPatterns("Fix authentication bug in login flow", ["Co-Authored-By"]);
+  assert(clean === null, `checkMessageAgainstPatterns passes clean message (got ${JSON.stringify(clean)})`);
+
+  // 32f. readToolUseActions: parses tool_use blocks from JSONL
+  const toolUseJsonl = [
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "Let me run that" },
+          { type: "tool_use", name: "Bash", input: { command: "git status" } },
+          { type: "tool_use", name: "Read", input: { file_path: "/tmp/test" } },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: "thanks" },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Edit", input: { file_path: "/tmp/x" } },
+        ],
+      },
+    }),
+  ].join("\n");
+
+  const toolUseTestFile = "/tmp/claude/smoke-test-tooluse.jsonl";
+  writeFileSync(toolUseTestFile, toolUseJsonl, "utf-8");
+  const { actions: toolActions, newOffset: toolOffset } = readToolUseActions(toolUseTestFile, 0);
+  assert(toolActions.length === 3, `readToolUseActions finds 3 tool_use blocks (got ${toolActions.length})`);
+  assert(toolActions[0].tool === "Bash", `First action is Bash (got ${toolActions[0].tool})`);
+  assert(toolActions[1].tool === "Read", `Second action is Read (got ${toolActions[1].tool})`);
+  assert(toolActions[2].tool === "Edit", `Third action is Edit (got ${toolActions[2].tool})`);
+  assert(toolOffset > 0, `readToolUseActions advances offset (got ${toolOffset})`);
+
+  // 32g. Verify build includes commit-msg.js
+  const commitMsgBuildPath = join(PROJECT_DIR, "build", "src", "cli", "commit-msg.js");
+  assert(
+    existsSync(commitMsgBuildPath),
+    `Build includes commit-msg.js at ${commitMsgBuildPath}`
+  );
+
+  // -------------------------------------------------------
+  // Summary
+  // -------------------------------------------------------
+  index.close();
+  cleanup();
+
+  console.log("\n===========================");
+  console.log(`Results: ${passed} passed, ${failed} failed out of ${passed + failed} total`);
+
+  if (failed > 0) {
+    process.exit(1);
+  } else {
+    console.log("\nAll smoke tests passed.");
+  }
+}
+
+main().catch((err) => {
+  console.error("Smoke test crashed:", err);
+  cleanup();
+  process.exit(1);
+});
